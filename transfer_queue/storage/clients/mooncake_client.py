@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Any, cast
 
 import torch
@@ -47,6 +50,41 @@ MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
 
 
+class _LocalBufferStaging:
+    """Shared logical byte budget; Mooncake owns the actual allocator and buffers."""
+
+    def __init__(self, config: dict[str, Any], local_buffer_size: int):
+        self.max_bytes = int(config["max_bytes"])
+        self.batch_bytes = int(config["batch_bytes"])
+        self.acquire_timeout_s = float(config["acquire_timeout_s"])
+        if not 0 < self.batch_bytes <= self.max_bytes <= local_buffer_size:
+            raise ValueError("local_buffer_staging requires 0 < batch_bytes <= max_bytes <= local_buffer_size")
+        if not math.isfinite(self.acquire_timeout_s) or self.acquire_timeout_s <= 0:
+            raise ValueError("local_buffer_staging.acquire_timeout_s must be finite and positive")
+        self._condition = threading.Condition()
+        self._in_use_bytes = 0
+        self._peak_bytes = 0
+
+    @contextmanager
+    def acquire(self, nbytes: int):
+        started = time.monotonic()
+        deadline = started + self.acquire_timeout_s
+        with self._condition:
+            while self._in_use_bytes + nbytes > self.max_bytes:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out acquiring {nbytes} local-buffer staging bytes")
+                self._condition.wait(remaining)
+            self._in_use_bytes += nbytes
+            self._peak_bytes = max(self._peak_bytes, self._in_use_bytes)
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._in_use_bytes -= nbytes
+                self._condition.notify_all()
+
+
 @StorageClientFactory.register("MooncakeStoreClient")
 class MooncakeStoreClient(StorageKVClient):
     """
@@ -67,6 +105,12 @@ class MooncakeStoreClient(StorageKVClient):
 
         self.global_segment_size = int(config.get("global_segment_size", 4096 * 1024 * 1024))
         self.local_buffer_size = int(config.get("local_buffer_size", 1024 * 1024 * 1024))
+        staging_config = config.get("local_buffer_staging", {})
+        self._local_buffer_staging = (
+            _LocalBufferStaging(staging_config, self.local_buffer_size)
+            if staging_config.get("enabled", False)
+            else None
+        )
         self.protocol = config.get("protocol", "tcp")
         self.device_name = config.get("device_name", "")
         if self.device_name is None:
@@ -133,6 +177,15 @@ class MooncakeStoreClient(StorageKVClient):
         )
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
+
+    @contextmanager
+    def _registered(self, region_ptrs: list[int], region_sizes: list[int]):
+        """Register the regions for the block's duration and always unregister them."""
+        registered_ptrs = self._register_all_buffers(region_ptrs, region_sizes)
+        try:
+            yield
+        finally:
+            self._unregister_all_buffers(registered_ptrs)
 
     def put(self, keys: list[str], values: list[Any]) -> list[dict | None]:
         """Stores multiple key-value pairs to MooncakeStore.
@@ -252,18 +305,35 @@ class MooncakeStoreClient(StorageKVClient):
     def _put_tensors_thread_worker(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> None:
         """Worker thread for putting tensors via the CPU RDMA path."""
 
-        batch_ptrs, batch_sizes, _ = self._preprocess_tensors_for_put(batch_tensors)
-        batch_ptr_reduced, batch_sizes_reduced = merge_contiguous_memory(batch_ptrs, batch_sizes)
-        self._register_all_buffers(batch_ptr_reduced, batch_sizes_reduced)
-        try:
-            self._batch_upsert_with_retry(batch_keys, batch_ptrs, batch_sizes)
-        finally:
-            self._unregister_all_buffers(batch_ptr_reduced)
+        batch_ptrs, batch_sizes, tensors = self._preprocess_tensors_for_put(batch_tensors)
+        if self._local_buffer_staging is not None:
+            self._put_with_local_buffer(batch_keys, tensors, batch_sizes)
+        else:
+            self._put_registered(batch_keys, batch_ptrs, batch_sizes)
+
+    def _put_registered(self, keys: list[str], ptrs: list[int], sizes: list[int]) -> None:
+        """Direct PUT: register the caller's own memory, transfer, unregister."""
+        with self._registered(*merge_contiguous_memory(ptrs, sizes)):
+            self._batch_upsert_with_retry(keys, ptrs, sizes)
+
+    def _put_with_local_buffer(self, keys: list[str], buffers: list[Tensor], sizes: list[int]) -> None:
+        """Stage a whole worker batch, or use the original direct PUT path."""
+        staging = self._local_buffer_staging
+        assert staging is not None
+        _, nbytes = _aligned_offsets(sizes)
+        if nbytes <= staging.batch_bytes and all(sizes):
+            with staging.acquire(nbytes):
+                views = [memoryview(b.detach().reshape(-1).view(torch.uint8).numpy()) for b in buffers]
+                ret = self._store.upsert_batch(keys, views, config=self.replica_config)
+            if ret == 0:
+                return
+            logger.warning(f"upsert_batch failed with {ret}; falling back for {len(keys)} keys")
+
+        self._put_registered(keys, [b.data_ptr() for b in buffers], sizes)
 
     def _put_bytes_thread_worker(self, batch_keys: list[str], batch_values: list[Any]) -> list[int]:
         """Worker thread for putting batch of non-tensors to MooncakeStore."""
 
-        # TODO: switch to a pre-registered buffer from MooncakeStore once such an API is available.
         region_ptrs: list[int] = []
         region_sizes: list[int] = []
 
@@ -282,13 +352,13 @@ class MooncakeStoreClient(StorageKVClient):
         buffers, batch_sizes = serial_utils.batch_encode_into(
             batch_values, alloc, num_workers=MAX_SERIAL_WORKER_THREADS
         )
-        batch_ptrs = [cast(Tensor, b).data_ptr() for b in buffers]
 
-        self._register_all_buffers(region_ptrs, region_sizes)
-        try:
-            self._batch_upsert_with_retry(batch_keys, batch_ptrs, batch_sizes)
-        finally:
-            self._unregister_all_buffers(region_ptrs)
+        if self._local_buffer_staging is not None:
+            self._put_with_local_buffer(batch_keys, buffers, batch_sizes)
+        else:
+            batch_ptrs = [cast(Tensor, b).data_ptr() for b in buffers]
+            with self._registered(region_ptrs, region_sizes):
+                self._batch_upsert_with_retry(batch_keys, batch_ptrs, batch_sizes)
 
         return batch_sizes
 
@@ -408,11 +478,8 @@ class MooncakeStoreClient(StorageKVClient):
             batch_dtypes, batch_shapes
         )
 
-        self._register_all_buffers(region_ptrs, region_sizes)
-        try:
+        with self._registered(region_ptrs, region_sizes):
             self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
-        finally:
-            self._unregister_all_buffers(region_ptrs)
 
         return batch_buffer_tensors, indexes
 
@@ -499,11 +566,8 @@ class MooncakeStoreClient(StorageKVClient):
             batch_dtypes, batch_shapes
         )
 
-        self._register_all_buffers(region_ptrs, region_sizes)
-        try:
+        with self._registered(region_ptrs, region_sizes):
             self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
-        finally:
-            self._unregister_all_buffers(region_ptrs)
 
         return serial_utils.batch_decode_from(batch_buffer_tensors), indexes
 
@@ -680,9 +744,14 @@ class MooncakeStoreClient(StorageKVClient):
             size_list.append(t.nbytes)
         return ptr_list, size_list, tensor_list
 
-    def _register_all_buffers(self, ptrs, sizes):
+    def _register_all_buffers(self, ptrs, sizes) -> list[int]:
+        registered = []
         for ptr, size in zip(ptrs, sizes, strict=True):
+            if size == 0:
+                continue
             self._store.register_buffer(ptr, size)
+            registered.append(ptr)
+        return registered
 
     def _unregister_all_buffers(self, ptrs):
         for ptr in ptrs:

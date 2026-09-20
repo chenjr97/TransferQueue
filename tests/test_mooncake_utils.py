@@ -18,7 +18,7 @@ import importlib
 import logging
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 import torch
@@ -296,6 +296,42 @@ class TestGdrStagingCuda:
             assert torch.equal(result[0], t)
         finally:
             staging.close(store)
+
+
+# ===========================================================================
+# MooncakeStoreClient buffer registration
+# ===========================================================================
+
+
+def _make_registration_client():
+    """Minimal MooncakeStoreClient-like object for registration testing."""
+    from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
+
+    client = object.__new__(MooncakeStoreClient)
+    client._store = MagicMock()
+    client._store.register_buffer.return_value = 0
+    return client
+
+
+class TestRegisterAllBuffers:
+    def test_zero_sized_regions_are_skipped(self):
+        # register_buffer rejects length 0, and unregistering it would fail too.
+        client = _make_registration_client()
+        assert client._register_all_buffers([0x1000, 0x2000, 0x3000], [8, 0, 16]) == [0x1000, 0x3000]
+        assert client._store.register_buffer.call_args_list == [call(0x1000, 8), call(0x3000, 16)]
+
+    def test_failure_code_unregisters_earlier_regions_and_raises(self):
+        client = _make_registration_client()
+        client._store.register_buffer.side_effect = [0, 0, -600]
+        with pytest.raises(RuntimeError, match="register_buffer failed with error code: -600"):
+            client._register_all_buffers([0x1000, 0x2000, 0x3000], [8, 8, 8])
+        assert client._store.unregister_buffer.call_args_list == [call(0x1000), call(0x2000)]
+
+    def test_registered_context_manager_unregisters_on_error(self):
+        client = _make_registration_client()
+        with pytest.raises(ValueError), client._registered([0x1000], [8]):
+            raise ValueError("boom")
+        client._store.unregister_buffer.assert_called_once_with(0x1000)
 
 
 # ===========================================================================
