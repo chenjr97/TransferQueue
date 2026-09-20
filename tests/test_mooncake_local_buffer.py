@@ -17,6 +17,7 @@
 import argparse
 import ctypes
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
@@ -29,6 +30,10 @@ from transfer_queue.storage.clients import mooncake_client as mc
 from transfer_queue.utils.mooncake_utils import _aligned_offsets
 
 
+class BufferHandle(bytearray):
+    pass
+
+
 class BufferStore:
     def __init__(self):
         self.data = {}
@@ -36,6 +41,9 @@ class BufferStore:
         self.register_calls = []
         self.staged_calls = []
         self.direct_calls = []
+        self.staged_get_calls = []
+        self.direct_get_calls = []
+        self.handles = []
         self.closed = False
 
     def setup(self, *args):
@@ -67,10 +75,17 @@ class BufferStore:
         return [0 if size else -600 for size in sizes]
 
     def batch_get_into(self, keys, ptrs, sizes):
+        self.direct_get_calls.append(list(keys))
         for key, ptr, size in zip(keys, ptrs, sizes, strict=True):
             assert len(self.data[key]) == size
             ctypes.memmove(ptr, self.data[key], size)
         return sizes
+
+    def batch_get_buffer(self, keys):
+        self.staged_get_calls.append(list(keys))
+        handles = [BufferHandle(self.data[key]) if key in self.data else None for key in keys]
+        self.handles.extend(weakref.ref(handle) for handle in handles if handle is not None)
+        return handles
 
     def batch_remove(self, keys, force):
         for key in keys:
@@ -99,7 +114,6 @@ def make_client(monkeypatch):
             "local_buffer_staging": {
                 "enabled": enabled,
                 "max_bytes": 2048,
-                "batch_bytes": 1024,
                 "acquire_timeout_s": 0.1,
                 **staging,
             },
@@ -139,6 +153,9 @@ def test_tensor_wire_format_and_roundtrip(make_client, dtype):
         raw = value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
         assert client._store.data[key] == raw
     result = client.get(keys, [v.shape for v in values], [dtype] * 2)
+    assert client._store.staged_get_calls == [keys]
+    assert not client._store.register_calls
+    assert all(handle() is None for handle in client._store.handles)
     client.close()
     for value, actual in zip(values, result, strict=True):
         torch.testing.assert_close(actual, value)
@@ -151,6 +168,9 @@ def test_bytes_metadata_and_independent_decoded_storage(make_client):
     assert meta == [{"packed_size": len(client._store.data[k])} for k in keys]
     assert client._store.staged_calls
     assert not client._store.direct_calls
+    assert client._store.staged_get_calls
+    assert not client._store.direct_get_calls
+    assert all(handle() is None for handle in client._store.handles)
     client.put(keys, ["replacement"] * len(keys))
     client.close()
     assert result[0] == "small" and result[2] == 42
@@ -166,6 +186,8 @@ def test_mixed_output_order_and_default_off(make_client):
     assert staged_meta == direct_meta
     assert staged._store.data == direct._store.data
     assert not direct._store.staged_calls
+    assert not direct._store.staged_get_calls
+    assert direct._store.direct_get_calls
     torch.testing.assert_close(result[0], values[0])
     torch.testing.assert_close(result[2], values[2])
     assert result[1] == values[1] and result[3] == values[3]
@@ -173,7 +195,7 @@ def test_mixed_output_order_and_default_off(make_client):
 
 def test_byte_and_count_limits_alignment_and_oversized(make_client, monkeypatch):
     monkeypatch.setattr(mc, "BATCH_SIZE_LIMIT", 3)
-    client = make_client(batch_bytes=700)
+    client = make_client(max_bytes=700)
     values = [torch.zeros(n, dtype=torch.uint8) for n in [1, 257, 700, 10, 1, 1, 1]]
     client.put([str(i) for i in range(len(values))], values)
     for keys, sizes in client._store.staged_calls:
@@ -186,7 +208,7 @@ def test_byte_and_count_limits_alignment_and_oversized(make_client, monkeypatch)
 
 @pytest.mark.parametrize("count", [2, 3])
 def test_whole_batch_capacity_boundary_preserves_direct_registration(make_client, count):
-    client = make_client(batch_bytes=512)
+    client = make_client(max_bytes=512)
     source = torch.arange(count * 256, dtype=torch.int32).to(torch.uint8)
     values = list(source.split(256))
     keys = [str(i) for i in range(count)]
@@ -231,7 +253,7 @@ def test_full_batch_fallback_then_per_key_retry(make_client, monkeypatch):
 
 
 def test_fallback_releases_budget_before_the_direct_put(make_client, monkeypatch):
-    client = make_client(max_bytes=256, batch_bytes=256)
+    client = make_client(max_bytes=256)
     monkeypatch.setattr(client._store, "upsert_batch", Mock(return_value=-500))
     original = client._store.batch_upsert_from
 
@@ -271,8 +293,10 @@ def test_failure_releases_budget_and_registered_regions(make_client, monkeypatch
     assert not client._store.regions
 
 
-def test_budget_shared_across_public_calls(make_client, monkeypatch):
-    client = make_client(max_bytes=256, batch_bytes=256, acquire_timeout_s=2)
+@pytest.mark.parametrize("operation", ["put", "get"])
+def test_budget_shared_across_public_calls(make_client, monkeypatch, operation):
+    client = make_client(max_bytes=256, acquire_timeout_s=2)
+    client.put(["b"], [torch.ones(1)])
     entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
     store = client._store
     original = store.upsert_batch
@@ -297,18 +321,21 @@ def test_budget_shared_across_public_calls(make_client, monkeypatch):
         try:
             first = executor.submit(client.put, ["a"], [torch.ones(1)])
             assert entered.wait(2)
-            second = executor.submit(client.put, ["b"], [torch.ones(1)])
+            if operation == "put":
+                second = executor.submit(client.put, ["b"], [torch.ones(1)])
+            else:
+                second = executor.submit(client.get, ["b"], [(1,)], [torch.float32])
             assert waiting.wait(2)
             assert calls == 1
         finally:
             release.set()
         first.result(timeout=3)
         second.result(timeout=3)
-    assert calls == 2
+    assert calls == (2 if operation == "put" else 1)
 
 
 def test_budget_timeout_does_not_submit_or_leak(make_client):
-    client = make_client(max_bytes=256, batch_bytes=256, acquire_timeout_s=0.01)
+    client = make_client(max_bytes=256, acquire_timeout_s=0.01)
     with client._local_buffer_staging.acquire(256):
         with pytest.raises(TimeoutError, match="staging bytes"):
             client.put(["a"], [torch.ones(1)])
@@ -321,8 +348,6 @@ def test_budget_timeout_does_not_submit_or_leak(make_client):
     [
         {"max_bytes": 0},
         {"max_bytes": 8192},
-        {"batch_bytes": 0},
-        {"batch_bytes": 3000},
         {"acquire_timeout_s": 0},
         {"acquire_timeout_s": float("nan")},
         {"acquire_timeout_s": float("inf")},
@@ -352,6 +377,13 @@ def test_gdr_tensor_path_keeps_priority_while_bytes_use_cpu_staging(make_client,
     assert meta[0] == {"n_chunks": 2}
     assert meta[1] == {"packed_size": len(client._store.data["object"])}
     assert all(keys == ["object"] for keys, _ in client._store.staged_calls)
+    gdr_get = Mock(return_value=([torch.ones(1)], [0]))
+    monkeypatch.setattr(client, "_get_tensors_gdr", gdr_get)
+    result = client.get(["tensor", "object"], [(1,), None], [torch.float32, None], meta)
+    gdr_get.assert_called_once()
+    assert client._store.staged_get_calls == [["object"]]
+    torch.testing.assert_close(result[0], torch.ones(1))
+    assert result[1] == "abc"
 
 
 def test_mixed_empty_and_nonempty_matches_direct_path_outcome(make_client):
@@ -368,7 +400,7 @@ def test_mixed_empty_and_nonempty_matches_direct_path_outcome(make_client):
 
 
 def test_oversized_serialized_batch_preserves_one_registration_and_metadata(make_client):
-    client = make_client(batch_bytes=256)
+    client = make_client(max_bytes=256)
     values = [{"payload": torch.arange(1000)}, {"payload": torch.arange(2000)}, "small"]
     keys = ["a", "b", "c"]
     meta = client.put(keys, values)
@@ -391,7 +423,103 @@ def test_benchmark_reports_distinct_put_and_get_measurements(make_client, kind):
         result = run(config, args, enabled)
         put, get = result["put"]["store"], result["get"]["store"]
         assert result["config"]["local_buffer_staging"]["enabled"] == enabled
-        # Only PUT is staged; GET keeps registering its own receive buffers either way.
         assert (put.get("register_buffer_calls", 0) == 0) == enabled
-        assert get["register_buffer_calls"] > 0
-        assert get["batch_get_into_calls"] == 4
+        assert (get.get("register_buffer_calls", 0) == 0) == enabled
+        assert get["batch_get_buffer_calls" if enabled else "batch_get_into_calls"] == 4
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_get_batch_limit_preserves_coalesced_direct_fallback(make_client, monkeypatch, count):
+    monkeypatch.setattr(mc, "BATCH_SIZE_LIMIT", count)
+    client = make_client(max_bytes=512)
+    keys = [str(i) for i in range(count + 1)]
+    values = [torch.arange(256, dtype=torch.uint8) for _ in keys]
+    client.put(keys, values)
+    client._store.register_calls.clear()
+    result = client.get(keys, [v.shape for v in values], [v.dtype for v in values])
+    if count == 2:
+        assert sorted(client._store.staged_get_calls) == [keys[:count], keys[count:]]
+        assert not client._store.register_calls
+    else:
+        assert client._store.staged_get_calls == [keys[count:]]
+        assert client._store.direct_get_calls == [keys[:count]]
+        assert [size for _, size in client._store.register_calls] == [count * 256]
+    for expected, actual in zip(values, result, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+def test_get_partial_failure_releases_handles_and_budget_before_retry(make_client, monkeypatch):
+    client = make_client(max_bytes=512)
+    keys = ["a", "b"]
+    client.put(keys, [torch.ones(1), torch.ones(1)])
+    staged_get = client._store.batch_get_buffer
+    direct_get = client._store.batch_get_into
+    calls = []
+
+    def partial_get(keys):
+        handles = staged_get(keys)
+        handles[1] = None
+        return handles
+
+    def retry_get(keys, ptrs, sizes):
+        assert all(handle() is None for handle in client._store.handles)
+        with client._local_buffer_staging.acquire(512):
+            calls.append(list(keys))
+            if len(calls) == 1:
+                direct_get(keys[:1], ptrs[:1], sizes[:1])
+                return [sizes[0], -500]
+            return direct_get(keys, ptrs, sizes)
+
+    monkeypatch.setattr(client._store, "batch_get_buffer", partial_get)
+    monkeypatch.setattr(client._store, "batch_get_into", retry_get)
+    result = client.get(keys, [(1,)] * 2, [torch.float32] * 2)
+    assert calls == [keys, ["b"]]
+    assert not client._store.regions
+    for value in result:
+        torch.testing.assert_close(value, torch.ones(1))
+
+
+@pytest.mark.parametrize("failure", ["native", "count", "size", "copy", "direct"])
+def test_get_failure_releases_resources(make_client, monkeypatch, failure):
+    client = make_client()
+    client.put(["a"], [torch.ones(1)])
+    store = client._store
+    if failure == "native":
+        monkeypatch.setattr(store, "batch_get_buffer", Mock(side_effect=RuntimeError("native failure")))
+    elif failure == "count":
+        original = store.batch_get_buffer
+        monkeypatch.setattr(store, "batch_get_buffer", lambda keys: original(keys * 2))
+    elif failure == "size":
+        store.data["a"] = b"bad size"
+    elif failure == "copy":
+        monkeypatch.setattr(torch.Tensor, "copy_", Mock(side_effect=RuntimeError("copy failure")))
+    else:
+        monkeypatch.setattr(store, "batch_get_buffer", Mock(return_value=[None]))
+        monkeypatch.setattr(store, "batch_get_into", Mock(return_value=[-500]))
+    with pytest.raises(RuntimeError):
+        client.get(["a"], [(1,)], [torch.float32])
+    assert all(handle() is None for handle in store.handles)
+    assert client._local_buffer_staging._in_use_bytes == 0
+    assert not store.regions
+
+
+def test_get_timeout_does_not_submit(make_client):
+    client = make_client(max_bytes=256, acquire_timeout_s=0.01)
+    client.put(["a"], [torch.ones(1)])
+    with client._local_buffer_staging.acquire(256):
+        with pytest.raises(TimeoutError, match="staging bytes"):
+            client.get(["a"], [(1,)], [torch.float32])
+    assert not client._store.staged_get_calls
+    assert not client._store.direct_get_calls
+    torch.testing.assert_close(client.get(["a"], [(1,)], [torch.float32])[0], torch.ones(1))
+
+
+def test_get_zero_bytes_bypasses_native_allocator(make_client, monkeypatch):
+    client = make_client()
+    direct = Mock(return_value=[0])
+    monkeypatch.setattr(client._store, "batch_get_into", direct)
+    result = client.get(["empty"], [(0, 2)], [torch.int64])
+    assert result[0].shape == (0, 2)
+    assert not client._store.staged_get_calls
+    assert not client._store.register_calls
+    direct.assert_called_once()

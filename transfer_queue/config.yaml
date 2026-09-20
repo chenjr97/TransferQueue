@@ -105,19 +105,15 @@ backend:
     # Size of the pre-registered CUDA staging buffer in MB (only used when use_gdr: true).
     gdr_staging_buffer_mb: 1024
 
-    # Route CPU PUT through the local buffer Mooncake already registers during setup,
-    # trading one payload memory copy for the per-PUT register/unregister pair.
-    # Disabled by default; benefit depends on the transport and object size, so measure
+    # Route CPU PUT/GET through the local buffer Mooncake already registers during setup,
+    # trading one payload memory copy for the per-call register/unregister pair.
+    # Benefit depends on the transport and object size, so measure
     # on the target hardware first. See docs/storage_backends/mooncake_local_buffer.md.
     local_buffer_staging:
       enabled: True
-      # Shared in-flight PUT byte budget for one client. Must be <= local_buffer_size.
+      # Shared in-flight PUT/GET byte budget for one client. Must be <= local_buffer_size.
       # 2GiB covers the perf-matrix max rank (64MB x 13 = 832MiB) with worker headroom.
       max_bytes: 2147483648
-      # 256-byte-aligned size limit per worker batch. Must be <= max_bytes.
-      # A batch larger than this uses the original direct path without subdivision.
-      # 1GiB is the smallest power-of-two that covers every current PUT case.
-      batch_bytes: 1073741824
       # How long a worker waits for budget before raising TimeoutError.
       acquire_timeout_s: 5.0
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run a PUT A/B experiment for local-buffer staging against an existing Mooncake master."""
+"""Run a PUT/GET A/B experiment for local-buffer staging against an existing Mooncake master."""
 
 import argparse
 import json
@@ -46,6 +46,7 @@ class TimedStore:
             "upsert_batch",
             "batch_upsert_from",
             "batch_get_into",
+            "batch_get_buffer",
         }:
             return method
 

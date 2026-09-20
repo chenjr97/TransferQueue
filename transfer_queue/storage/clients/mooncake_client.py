@@ -55,10 +55,9 @@ class _LocalBufferStaging:
 
     def __init__(self, config: dict[str, Any], local_buffer_size: int):
         self.max_bytes = int(config["max_bytes"])
-        self.batch_bytes = int(config["batch_bytes"])
         self.acquire_timeout_s = float(config["acquire_timeout_s"])
-        if not 0 < self.batch_bytes <= self.max_bytes <= local_buffer_size:
-            raise ValueError("local_buffer_staging requires 0 < batch_bytes <= max_bytes <= local_buffer_size")
+        if not 0 < self.max_bytes <= local_buffer_size:
+            raise ValueError("local_buffer_staging requires 0 < max_bytes <= local_buffer_size")
         if not math.isfinite(self.acquire_timeout_s) or self.acquire_timeout_s <= 0:
             raise ValueError("local_buffer_staging.acquire_timeout_s must be finite and positive")
         self._condition = threading.Condition()
@@ -321,7 +320,7 @@ class MooncakeStoreClient(StorageKVClient):
         staging = self._local_buffer_staging
         assert staging is not None
         _, nbytes = _aligned_offsets(sizes)
-        if nbytes <= staging.batch_bytes and all(sizes):
+        if nbytes <= staging.max_bytes and all(sizes):
             with staging.acquire(nbytes):
                 views = [memoryview(b.detach().reshape(-1).view(torch.uint8).numpy()) for b in buffers]
                 ret = self._store.upsert_batch(keys, views, config=self.replica_config)
@@ -478,10 +477,42 @@ class MooncakeStoreClient(StorageKVClient):
             batch_dtypes, batch_shapes
         )
 
-        with self._registered(region_ptrs, region_sizes):
-            self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
+        if self._local_buffer_staging is None or not self._get_with_local_buffer(
+            batch_keys, batch_buffer_tensors, batch_nbytes
+        ):
+            with self._registered(region_ptrs, region_sizes):
+                self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
 
         return batch_buffer_tensors, indexes
+
+    def _get_with_local_buffer(self, keys: list[str], buffers: list[Tensor], sizes: list[int]) -> bool:
+        """Copy a staged batch into owned outputs; return False for direct fallback."""
+        staging = self._local_buffer_staging
+        assert staging is not None
+        _, nbytes = _aligned_offsets(sizes)
+        if nbytes > staging.max_bytes or not all(sizes):
+            return False
+
+        with staging.acquire(nbytes):
+            handles = self._store.batch_get_buffer(keys)
+            try:
+                if len(handles) != len(keys):
+                    raise RuntimeError(f"batch_get_buffer returned {len(handles)} results, expected {len(keys)}")
+                if any(handle is None for handle in handles):
+                    logger.warning(f"batch_get_buffer failed; falling back for {len(keys)} keys")
+                    return False
+                for i, buffer in enumerate(buffers):
+                    with memoryview(handles[i]) as view:
+                        if view.nbytes != sizes[i]:
+                            raise RuntimeError(
+                                f"batch_get_buffer size mismatch for key `{keys[i]}`: "
+                                f"got {view.nbytes}, expected {sizes[i]}"
+                            )
+                        buffer.reshape(-1).view(torch.uint8).copy_(torch.frombuffer(view, dtype=torch.uint8))
+                return True
+            finally:
+                # Free native allocations before returning their logical byte budget.
+                handles.clear()
 
     def _get_tensors_gdr(
         self,
@@ -561,13 +592,7 @@ class MooncakeStoreClient(StorageKVClient):
         # consumers apply the actual dtype/shape interpretation when unpacking.
         batch_shapes = [(sz,) for sz in batch_packed_sizes]
         batch_dtypes = [torch.uint8] * len(batch_keys)
-        batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
-        batch_buffer_tensors, batch_buffer_ptrs, region_ptrs, region_sizes = allocate_empty_tensors(
-            batch_dtypes, batch_shapes
-        )
-
-        with self._registered(region_ptrs, region_sizes):
-            self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
+        batch_buffer_tensors, _ = self._get_tensors_thread_worker(batch_keys, batch_shapes, batch_dtypes, indexes)
 
         return serial_utils.batch_decode_from(batch_buffer_tensors), indexes
 
