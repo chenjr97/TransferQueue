@@ -32,7 +32,12 @@ from transfer_queue.utils.mooncake_utils import (
     chunk_subkeys,
     split_by_bytes,
 )
-from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes, merge_contiguous_memory
+from transfer_queue.utils.tensor_utils import (
+    allocate_empty_tensors,
+    get_nbytes,
+    merge_contiguous_memory,
+    validate_buffer_allocation,
+)
 
 logger = get_logger(__name__)
 
@@ -104,6 +109,8 @@ class MooncakeStoreClient(StorageKVClient):
 
         self.global_segment_size = int(config.get("global_segment_size", 4096 * 1024 * 1024))
         self.local_buffer_size = int(config.get("local_buffer_size", 1024 * 1024 * 1024))
+        self.get_buffer_allocation = config.get("get_buffer_allocation", "torch")
+        validate_buffer_allocation(self.get_buffer_allocation)
         staging_config = config.get("local_buffer_staging", {})
         self._local_buffer_staging = (
             _LocalBufferStaging(staging_config, self.local_buffer_size)
@@ -474,7 +481,7 @@ class MooncakeStoreClient(StorageKVClient):
     ) -> tuple[list[Tensor], list[int]]:
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
         batch_buffer_tensors, batch_buffer_ptrs, region_ptrs, region_sizes = allocate_empty_tensors(
-            batch_dtypes, batch_shapes
+            batch_dtypes, batch_shapes, allocation=self.get_buffer_allocation
         )
 
         if self._local_buffer_staging is None or not self._get_with_local_buffer(
