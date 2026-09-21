@@ -16,7 +16,6 @@
 
 import argparse
 import ctypes
-import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -106,13 +105,12 @@ def make_client(monkeypatch):
     monkeypatch.setattr(mc, "RETRY_DELAY_SECONDS", 0)
     clients = []
 
-    def make(enabled=True, get_buffer_allocation="torch", **staging):
+    def make(enabled=True, **staging):
         config = {
             "local_hostname": "127.0.0.1",
             "metadata_server": "P2PHANDSHAKE",
             "master_server_address": "127.0.0.1:50051",
             "local_buffer_size": 4096,
-            "get_buffer_allocation": get_buffer_allocation,
             "local_buffer_staging": {
                 "enabled": enabled,
                 "max_bytes": 2048,
@@ -139,73 +137,6 @@ def roundtrip(client, values):
         custom_backend_meta=meta,
     )
     return keys, meta, result
-
-
-@pytest.mark.parametrize("allocation", ["torch", "mmap_huge"])
-@pytest.mark.parametrize("staged", [False, True])
-def test_get_buffer_allocation_roundtrip(make_client, allocation, staged):
-    if allocation != "torch" and sys.platform != "linux":
-        pytest.skip("Linux mmap advice")
-    client = make_client(enabled=staged, get_buffer_allocation=allocation)
-    if staged:
-        client._local_buffer_staging.max_bytes = 4 * 1024**2
-    values = [torch.full((2 * 1024**2,), 37, dtype=torch.uint8)]
-    _, _, result = roundtrip(client, values)
-    assert bool(client._store.staged_get_calls) == staged
-    assert bool(client._store.direct_get_calls) != staged
-    assert not client._store.regions
-    client.close()
-    torch.testing.assert_close(result[0], values[0])
-
-
-def test_get_policy_does_not_change_put_allocation(make_client, monkeypatch):
-    if sys.platform != "linux":
-        pytest.skip("Linux mmap advice")
-    client = make_client(enabled=False, get_buffer_allocation="mmap_huge")
-    policies = []
-    original = mc.allocate_empty_tensors
-
-    def capture(*args, **kwargs):
-        policies.append(kwargs.get("allocation", "torch"))
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(mc, "allocate_empty_tensors", capture)
-    roundtrip(client, ["bytes payload"])
-    assert policies == ["torch", "mmap_huge"]
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux mmap advice")
-def test_mmap_get_direct_fallback_and_failure_cleanup(make_client, monkeypatch):
-    client = make_client(get_buffer_allocation="mmap_huge")
-    source = torch.full((2 * 1024**2,), 11, dtype=torch.uint8)
-    client.put(["large"], [source])
-    # The default small staging budget forces direct GET into the mmap output.
-    result = client.get(["large"], [source.shape], [source.dtype])
-    torch.testing.assert_close(result[0], source)
-    assert client._store.direct_get_calls == [["large"]]
-    assert not client._store.regions
-    del result
-
-    owners = []
-    original = torch.frombuffer
-
-    def capture(owner, **kwargs):
-        owners.append(weakref.ref(owner))
-        return original(owner, **kwargs)
-
-    monkeypatch.setattr(torch, "frombuffer", capture)
-
-    def fail_read(*args):
-        raise RuntimeError("read failed")
-
-    monkeypatch.setattr(client._store, "batch_get_into", fail_read)
-    with pytest.raises(RuntimeError, match="read failed"):
-        client.get(["large"], [source.shape], [source.dtype])
-    import gc
-
-    gc.collect()
-    assert owners and all(owner() is None for owner in owners)
-    assert not client._store.regions
 
 
 @pytest.mark.parametrize(

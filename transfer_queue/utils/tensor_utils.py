@@ -13,12 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ctypes
 import logging
-import mmap
 import operator
 import os
-import sys
 from functools import reduce
 
 import torch
@@ -27,46 +24,9 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
-GET_BUFFER_ALLOCATIONS = ("torch", "mmap_huge")
-MMAP_MIN_BYTES = 2 * 1024**2
-
-
-def validate_buffer_allocation(allocation: str) -> None:
-    """Reject unsupported experiments instead of silently changing their meaning."""
-    if allocation not in GET_BUFFER_ALLOCATIONS:
-        raise ValueError(f"Unknown buffer allocation: {allocation!r}; expected {GET_BUFFER_ALLOCATIONS}")
-    if allocation != "torch" and (
-        sys.platform != "linux"
-        or not hasattr(mmap.mmap, "madvise")
-        or not hasattr(mmap, "MADV_HUGEPAGE")
-    ):
-        raise RuntimeError("mmap buffer experiments require Linux mmap.madvise and THP advice constants")
-
-
-def _allocate_cpu_buffer(numel: int, dtype: torch.dtype, allocation: str) -> Tensor:
-    if allocation == "torch":
-        return torch.empty(numel, dtype=dtype)
-    nbytes = numel * torch.empty((), dtype=dtype).element_size()
-    if nbytes < MMAP_MIN_BYTES:
-        return torch.empty(numel, dtype=dtype)
-
-    length = (nbytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
-    # Reserve padding so the advised region can start on a 2 MiB boundary.
-    owner = mmap.mmap(-1, length + MMAP_MIN_BYTES, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    try:
-        address = ctypes.addressof(ctypes.c_char.from_buffer(owner))
-        offset = (-address) % MMAP_MIN_BYTES
-        owner.madvise(mmap.MADV_HUGEPAGE, offset, length)
-        # Storage retains owner, including through as_strided views. Never close
-        # this mapping at the operation boundary while a tensor can still use it.
-        return torch.frombuffer(owner, dtype=dtype, count=numel, offset=offset)
-    except BaseException:
-        owner.close()
-        raise
-
 
 def allocate_empty_tensors(
-    dtypes: list[torch.dtype], shapes: list[tuple], *, allocation: str = "torch"
+    dtypes: list[torch.dtype], shapes: list[tuple]
 ) -> tuple[list[Tensor], list[int], list[int], list[int]]:
     """Allocate empty tensors, grouping same dtypes into shared memory blocks.
 
@@ -77,9 +37,6 @@ def allocate_empty_tensors(
     Args:
         dtypes: List of torch dtypes for each tensor.
         shapes: List of shapes (tuples) for each tensor.
-        allocation: CPU buffer policy. mmap modes apply to dtype groups of at
-            least 2 MiB; smaller groups keep torch allocation. Huge pages are
-            requested, not guaranteed. Unsupported modes or advice failures raise.
 
     Returns:
         A tuple containing:
@@ -94,7 +51,6 @@ def allocate_empty_tensors(
         >>> tensors, ptrs, region_ptrs, region_sizes = allocate_empty_tensors(dtypes, shapes)
         >>> # tensors[0], [1], [3] share the same dtype and memory block
     """
-    validate_buffer_allocation(allocation)
     assert len(dtypes) == len(shapes), "dtypes and shapes must have the same length"
 
     if len(dtypes) == 0:
@@ -125,7 +81,7 @@ def allocate_empty_tensors(
             total_elements += num_elements
 
         # Allocate one big contiguous memory block for this dtype
-        big_tensor = _allocate_cpu_buffer(total_elements, dtype, allocation)
+        big_tensor = torch.empty(total_elements, dtype=dtype)
         region_ptrs.append(big_tensor.data_ptr())
         region_sizes.append(big_tensor.nbytes)
 

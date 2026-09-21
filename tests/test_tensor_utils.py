@@ -15,11 +15,6 @@
 
 """Unit tests for transfer_queue.utils.tensor_utils."""
 
-import gc
-import mmap
-import sys
-import weakref
-
 import pytest
 import torch
 
@@ -29,81 +24,6 @@ from transfer_queue.utils.tensor_utils import (
     get_nbytes,
     merge_contiguous_memory,
 )
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux mmap advice")
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float64])
-def test_mmap_group_views_keep_owner_alive(monkeypatch, dtype):
-    owners = []
-    original = torch.frombuffer
-
-    def capture(owner, **kwargs):
-        owners.append(weakref.ref(owner))
-        return original(owner, **kwargs)
-
-    monkeypatch.setattr(torch, "frombuffer", capture)
-    count = 2 * 1024**2 // torch.empty((), dtype=dtype).element_size()
-    tensors, pointers, regions, sizes = allocate_empty_tensors(
-        [dtype, dtype], [(count // 2,), (count // 2,)], allocation="mmap_huge"
-    )
-    assert len(owners) == len(regions) == 1
-    assert regions[0] % (2 * 1024**2) == 0
-    assert sizes == [2 * 1024**2]
-    assert pointers[1] - pointers[0] == 1024**2
-    tensors[0].fill_(3)
-    tensors[1].fill_(7)
-    view = tensors[1][::2]
-    del tensors
-    gc.collect()
-    assert owners[0]() is not None
-    assert torch.all(view == 7)
-    del view
-    gc.collect()
-    assert owners[0]() is None
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux mmap advice")
-def test_mmap_empty_and_small_groups_use_torch(monkeypatch):
-    monkeypatch.setattr(torch, "frombuffer", lambda *a, **kw: pytest.fail("small group used mmap"))
-    tensors, _, _, sizes = allocate_empty_tensors([torch.float32, torch.int64], [(0,), ()], allocation="mmap_huge")
-    assert [t.shape for t in tensors] == [torch.Size([0]), torch.Size([])]
-    assert sizes == [0, 8]
-
-
-@pytest.mark.parametrize("invalid_allocation", ["typo", "mmap_nohuge"])
-def test_allocation_validation(monkeypatch, invalid_allocation):
-    from transfer_queue.utils import tensor_utils
-
-    with pytest.raises(ValueError, match="Unknown buffer allocation"):
-        allocate_empty_tensors([], [], allocation=invalid_allocation)
-    monkeypatch.setattr(tensor_utils.sys, "platform", "win32")
-    with pytest.raises(RuntimeError, match="require Linux"):
-        allocate_empty_tensors([], [], allocation="mmap_huge")
-    assert allocate_empty_tensors([], []) == ([], [], [], [])
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux mmap advice")
-def test_mmap_huge_does_not_require_nohuge_advice(monkeypatch):
-    monkeypatch.delattr(mmap, "MADV_NOHUGEPAGE", raising=False)
-    tensors, _, _, sizes = allocate_empty_tensors([torch.uint8], [(2 * 1024**2,)], allocation="mmap_huge")
-    tensors[0].fill_(7)
-    assert sizes == [2 * 1024**2]
-    assert torch.all(tensors[0] == 7)
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux mmap advice")
-def test_madvise_failure_closes_mapping(monkeypatch):
-    owners = []
-
-    class FailingMapping(mmap.mmap):
-        def madvise(self, *args):
-            owners.append(self)
-            raise OSError("advice failed")
-
-    monkeypatch.setattr(mmap, "mmap", FailingMapping)
-    with pytest.raises(OSError, match="advice failed"):
-        allocate_empty_tensors([torch.uint8], [(2 * 1024**2,)], allocation="mmap_huge")
-    assert owners[0].closed
 
 
 class TestComputeStride:
